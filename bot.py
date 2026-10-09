@@ -15,6 +15,7 @@ import base64
 from datetime import datetime, timedelta
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
+from telegram.request import HTTPXRequest
 
 # Premium copy button (PTB 21+)
 try:
@@ -5285,7 +5286,22 @@ def main():
               "environment settings, a .env file, or systemd EnvironmentFile) and restart. "
               "The bot token is never hardcoded in this file for security.")
         return
-    app = ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(True).post_init(post_init).build()
+    # Give Telegram API requests more time and retry startup after temporary network failures.
+    telegram_request = HTTPXRequest(
+        connection_pool_size=20,
+        connect_timeout=30.0,
+        read_timeout=30.0,
+        write_timeout=30.0,
+        pool_timeout=10.0,
+    )
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .request(telegram_request)
+        .concurrent_updates(True)
+        .post_init(post_init)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("get1number", get1number_command))
@@ -5322,7 +5338,7 @@ def main():
         ).start()
 
     print("🚀 BOT RUNNING...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True, bootstrap_retries=-1)
 
 if __name__ == "__main__":
     import asyncio
