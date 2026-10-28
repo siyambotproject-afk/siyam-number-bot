@@ -350,7 +350,6 @@ def load_settings():
         return _settings_cache
     default = {
         "active_panel": "zenex",
-        "welcome_message": "✨ 𝗪𝗘𝗟𝗖𝗢𝗠𝗘 𝗧𝗢 RJ RONY TEST BOT🚀 ✨ \n━━━━━━━━━━━━━━━━━━━━━━\n🚀 Enjoy Premium Quality Service 🚀",
         "zenex_api_key": "ZNX_IQ52ED851U09ZAZL062U26GL",
         "zenex_base_url": "https://api.zenexnetwork.com",
         "panel_url": "https://t.me/Zenex_Number_bot?start=8346777366",
@@ -377,6 +376,8 @@ def load_settings():
         "channel_btn_label": "📢 MAIN CHANNEL",
         "support_btn_label": "💬 SUPPORT",
         "developer_btn_label": "👨‍💻 DEVELOPER BY",
+        "welcome_message": WELCOME_MESSAGE,
+        "developer_credit_label": "👨‍💻 Developer Contact",
         "manual_services": [],
         "active_provider": "zenex",
         "enabled_providers": [],
@@ -642,6 +643,58 @@ MAX_WITHDRAW = 10000
 SUPPORT_LINK = "https://t.me/DEM_Support_Chat"      # আপনার সাপোর্ট লিংক দিন
 DEVELOPER_LINK = "https://t.me/Davil_Raju"          # আপনার ডেভেলপার লিংক দিন
 DEVELOPER_NAME = "Davil Raju"                         # ডেভেলপারের নাম
+
+# ---- Welcome message + Developer credit (managed separately) ----
+# settings["welcome_message"]        -> text only, edited via Admin Panel > EDIT WELCOME MESSAGE
+# settings["developer_link"]         -> existing link setting (BOT SETTINGS > LINKS & CHANNELS)
+# settings["developer_credit_label"] -> clickable text shown under the welcome message
+WELCOME_MESSAGE_MAX_LEN = 3000
+DEVELOPER_CREDIT_DEFAULT_LABEL = "👨‍💻 Developer Contact"
+
+def get_welcome_text():
+    """Saved welcome message, or the built-in default if none/blank."""
+    try:
+        saved = load_settings().get("welcome_message")
+    except Exception:
+        saved = None
+    if isinstance(saved, str) and saved.strip():
+        return saved
+    return WELCOME_MESSAGE
+
+def _normalize_developer_url(link):
+    """Return a safe clickable URL or None. Never invents a link."""
+    link = str(link or "").strip()
+    if not link:
+        return None
+    low = link.lower()
+    if low.startswith(("https://", "http://", "tg://")):
+        return link
+    if low.startswith("t.me/"):
+        return "https://" + link
+    if re.fullmatch(r"@[A-Za-z0-9_]{3,}", link):
+        return "https://t.me/" + link[1:]
+    return None
+
+def get_developer_credit():
+    """(label, url) for the welcome message, or None when no valid link exists."""
+    try:
+        cfg = load_settings()
+    except Exception:
+        cfg = {}
+    url = _normalize_developer_url(cfg.get("developer_link")) or _normalize_developer_url(DEVELOPER_LINK)
+    if not url:
+        return None
+    label = (cfg.get("developer_credit_label") or "").strip() or DEVELOPER_CREDIT_DEFAULT_LABEL
+    return label, url
+
+def build_welcome_html():
+    """Welcome text (HTML-escaped) + clickable developer credit underneath."""
+    out = html.escape(get_welcome_text())
+    credit = get_developer_credit()
+    if credit:
+        label, url = credit
+        out += f'\n\n<a href="{html.escape(url, quote=True)}">{html.escape(label)}</a>'
+    return out
 
 request_queue = asyncio.Queue()
 MAX_WORKERS = 5000
@@ -1408,8 +1461,8 @@ def admin_main_keyboard():
         [make_reply_btn("USER MANAGEMENT",      emoji_id="5193063022226086560", style="success")],
         [make_reply_btn("SYSTEM CONFIGURATION", emoji_id="5341715473882955310", style="success")],
         [make_reply_btn("BOT SETTINGS",         emoji_id="5282843764451195532", style="primary")],
-        [make_reply_btn("EDIT WELCOME MESSAGE", emoji_id="5353027129250453493", style="primary")],
         [make_reply_btn("SERVICE MANAGEMENT",   emoji_id="5375338737028841420", style="primary")],
+        [make_reply_btn("EDIT WELCOME MESSAGE", emoji_id="5282843764451195532", style="primary")],
         [make_reply_btn("BACK TO MAIN",         emoji_id="5267490665117275176", style="danger")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -1442,7 +1495,6 @@ def bot_settings_keyboard():
         [make_reply_btn("ADD ADMIN",          emoji_id="5397916757333654639", style="success"),
          make_reply_btn("REMOVE ADMIN",       emoji_id="5244837092042750681", style="danger")],
         [make_reply_btn("LINKS & CHANNELS",   emoji_id="5253742260054409879", style="primary")],
-        [make_reply_btn("EDIT WELCOME MESSAGE", emoji_id="5353027129250453493", style="primary")],
         [make_reply_btn("SET OTP BONUS",      emoji_id="6233367447789899509", style="success"),
          make_reply_btn("SET REFERRAL BONUS", emoji_id="5420396762189831222", style="success")],
         [make_reply_btn("SET OTP CHAT ID",    emoji_id="5231200819986047254", style="primary")],
@@ -1486,6 +1538,7 @@ def rename_buttons_keyboard():
         [make_reply_btn("RENAME: SUPPORT BTN",       emoji_id="5251671501702196837", style="primary")],
         [make_reply_btn("RENAME: DEVELOPER BTN",     emoji_id="5267294466716244344", style="primary")],
         [make_reply_btn("RENAME: DEVELOPER NAME",    emoji_id="5267294466716244344", style="primary")],
+        [make_reply_btn("RENAME: DEVELOPER CREDIT",  emoji_id="5267294466716244344", style="primary")],
         [make_reply_btn("BACK TO LINKS & CHANNELS",  emoji_id="5267490665117275176", style="danger")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -2934,22 +2987,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     text = update.message.text.strip()
 
-    # Admin-editable welcome message. Save in the existing settings store.
-    if context.user_data.get("welcome_message_mode") and is_admin(uid):
-        if text == "CANCEL":
-            context.user_data.pop("welcome_message_mode", None)
-            await update.message.reply_text("❎ Welcome message edit cancelled.", reply_markup=bot_settings_keyboard())
-            return
-        if not text:
-            await update.message.reply_text("❌ Message cannot be empty. Send text or CANCEL.", reply_markup=cancel_keyboard())
-            return
-        settings = load_settings()
-        settings["welcome_message"] = text
-        save_settings(settings)
-        context.user_data.pop("welcome_message_mode", None)
-        await update.message.reply_text("✅ Welcome message updated and saved. New users will see it on /start.", reply_markup=bot_settings_keyboard())
-        return
-
     # Force-join gate — applies to every action for non-admins (not just
     # unmatched text), and re-checks live membership every time, so leaving
     # a channel later blocks the bot again until they rejoin.
@@ -3014,6 +3051,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Ban check
     if not is_admin(uid) and is_user_banned(uid):
         await update.message.reply_text("🚫 YOU ARE BANNED 🚫", reply_markup=main_keyboard(uid))
+        return
+
+    # Admin: EDIT WELCOME MESSAGE — waiting for the new text
+    if context.user_data.get("welcome_edit_mode") and is_admin(uid):
+        context.user_data.pop("welcome_edit_mode", None)
+        context.user_data["admin_mode"] = "main"
+        if text == "CANCEL":
+            await update.message.reply_text(
+                "❌ Welcome message edit cancelled. Nothing was changed.",
+                reply_markup=admin_main_keyboard())
+            return
+        new_text = update.message.text.strip()
+        if not new_text:
+            await update.message.reply_text("⚠️ Empty message. Nothing was changed.", reply_markup=admin_main_keyboard())
+            return
+        if len(new_text) > WELCOME_MESSAGE_MAX_LEN:
+            await update.message.reply_text(
+                f"⚠️ Too long ({len(new_text)} chars). Max {WELCOME_MESSAGE_MAX_LEN}. Nothing was changed.",
+                reply_markup=admin_main_keyboard())
+            return
+        _ws = load_settings()
+        _ws["welcome_message"] = new_text   # only this key; developer settings untouched
+        save_settings(_ws)
+        await update.message.reply_text(
+            "✅ <b>WELCOME MESSAGE UPDATED!</b>\n\nNew message will show on /start.",
+            parse_mode="HTML", reply_markup=admin_main_keyboard())
         return
 
     # Cancel
@@ -3144,6 +3207,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["system_config_mode"] = None
         context.user_data["admin_mode"] = "main"
         await update.message.reply_text("🔙 Back to admin panel.", reply_markup=admin_main_keyboard())
+        return
+
+    if text == "EDIT WELCOME MESSAGE" and context.user_data.get("admin_mode") == "main" and is_admin(uid):
+        context.user_data["welcome_edit_mode"] = True
+        await update.message.reply_text(
+            "✏️ <b>EDIT WELCOME MESSAGE</b>\n\n"
+            f"<b>Current:</b>\n<blockquote>{html.escape(get_welcome_text())}</blockquote>\n\n"
+            f"নতুন Welcome Message পাঠান (সর্বোচ্চ {WELCOME_MESSAGE_MAX_LEN} অক্ষর, সাধারণ টেক্সট)। "
+            "Developer Contact লিংক আলাদা — এটা বদলাবে না। বাতিল করতে CANCEL চাপুন।",
+            parse_mode="HTML", reply_markup=cancel_keyboard())
         return
 
     if text == "USER MANAGEMENT" and context.user_data.get("admin_mode") == "main" and is_admin(uid):
@@ -3420,21 +3493,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🔗 <b>LINKS & CHANNELS</b>", parse_mode="HTML", reply_markup=links_config_keyboard())
         return
 
-    if text == "EDIT WELCOME MESSAGE" and is_admin(uid) and (
-        context.user_data.get("admin_mode") == "main"
-        or context.user_data.get("bot_settings_mode") == "main"
-    ):
-        context.user_data["bot_settings_mode"] = "main"
-        current_welcome = load_settings().get("welcome_message") or WELCOME_MESSAGE
-        context.user_data["welcome_message_mode"] = True
-        await update.message.reply_text(
-            "✏️ <b>EDIT WELCOME MESSAGE</b>\n\n"
-            "বর্তমান welcome message পরিবর্তন করতে নতুন message পাঠান। একাধিক লাইন ব্যবহার করা যাবে।\n"
-            "Cancel করতে CANCEL চাপুন।\n\n"
-            "<b>বর্তমান message:</b>\n<pre>" + html.escape(str(current_welcome)) + "</pre>",
-            parse_mode="HTML", reply_markup=cancel_keyboard())
-        return
-
     if text == "API PROVIDER CONFIG" and context.user_data.get("bot_settings_mode") == "main" and is_admin(uid):
         context.user_data["zenex_config_mode"] = "main"
         await update.message.reply_text("📡 <b>API PROVIDER CONFIG</b>\n\n<blockquote>এখানে আপনি যেকোনো সাইটের (Zenex, miahsms বা অন্য কোনো panel) API যোগ করতে ও সুইচ করতে পারবেন।</blockquote>", parse_mode="HTML", reply_markup=provider_config_keyboard())
@@ -3657,7 +3715,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "RENAME: MAIN CHANNEL BTN": ("channel_btn_label", "📢 MAIN CHANNEL", "OTP গ্রুপ পোস্টের 'MAIN CHANNEL' বাটনের"),
         "RENAME: SUPPORT BTN":      ("support_btn_label", "💬 SUPPORT", "SUPPORT মেনুর 'SUPPORT' বাটনের"),
         "RENAME: DEVELOPER BTN":    ("developer_btn_label", "👨‍💻 DEVELOPER BY", "SUPPORT মেনুর 'DEVELOPER BY' বাটনের"),
-        "RENAME: DEVELOPER NAME":   ("developer_name", DEVELOPER_NAME, "/start ওয়েলকাম মেসেজে দেখানো ডেভেলপারের"),
+        "RENAME: DEVELOPER NAME":   ("developer_name", DEVELOPER_NAME, "সংরক্ষিত ডেভেলপার (এই নাম এখন /start-এ সরাসরি দেখানো হয় না; /start-এ 'DEVELOPER CREDIT' লেখাটি দেখায়) —"),
+        "RENAME: DEVELOPER CREDIT": ("developer_credit_label", DEVELOPER_CREDIT_DEFAULT_LABEL, "/start ওয়েলকাম মেসেজের নিচে ক্লিকযোগ্য 'Developer Contact' লেখার"),
     }
     if text in _rename_targets and context.user_data.get("bot_settings_mode") == "rename_btn_main" and is_admin(uid):
         key, default_label, desc = _rename_targets[text]
@@ -4952,15 +5011,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     context.user_data.clear()
-    _dev_cfg = load_settings()
-    _dev_url = _dev_cfg.get("developer_link") or DEVELOPER_LINK
-    _dev_name = _dev_cfg.get("developer_name") or DEVELOPER_NAME
-    _welcome_message = _dev_cfg.get("welcome_message") or WELCOME_MESSAGE
-    await update.message.reply_text(
-        _welcome_message + f"\n\n👨‍💻 Developer: [{_dev_name}]({_dev_url})",
-        parse_mode="Markdown",
-        disable_web_page_preview=True
-    )
+    try:
+        await update.message.reply_text(
+            build_welcome_html(),
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+    except Exception as e:
+        print(f"[welcome] HTML send failed, falling back to plain text: {e}")
+        await update.message.reply_text(get_welcome_text()[:4000], disable_web_page_preview=True)
     await update.message.reply_text("🔹 PLEASE USE THE BUTTONS BELOW:", reply_markup=main_keyboard(uid))
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
