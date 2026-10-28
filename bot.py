@@ -1408,6 +1408,7 @@ def admin_main_keyboard():
         [make_reply_btn("USER MANAGEMENT",      emoji_id="5193063022226086560", style="success")],
         [make_reply_btn("SYSTEM CONFIGURATION", emoji_id="5341715473882955310", style="success")],
         [make_reply_btn("BOT SETTINGS",         emoji_id="5282843764451195532", style="primary")],
+        [make_reply_btn("EDIT WELCOME MESSAGE", emoji_id="5353027129250453493", style="primary")],
         [make_reply_btn("SERVICE MANAGEMENT",   emoji_id="5375338737028841420", style="primary")],
         [make_reply_btn("BACK TO MAIN",         emoji_id="5267490665117275176", style="danger")]
     ]
@@ -3419,7 +3420,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🔗 <b>LINKS & CHANNELS</b>", parse_mode="HTML", reply_markup=links_config_keyboard())
         return
 
-    if text == "EDIT WELCOME MESSAGE" and context.user_data.get("bot_settings_mode") == "main" and is_admin(uid):
+    if text == "EDIT WELCOME MESSAGE" and is_admin(uid) and (
+        context.user_data.get("admin_mode") == "main"
+        or context.user_data.get("bot_settings_mode") == "main"
+    ):
+        context.user_data["bot_settings_mode"] = "main"
         current_welcome = load_settings().get("welcome_message") or WELCOME_MESSAGE
         context.user_data["welcome_message_mode"] = True
         await update.message.reply_text(
