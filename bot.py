@@ -378,6 +378,7 @@ def load_settings():
         "developer_btn_label": "👨‍💻 DEVELOPER BY",
         "welcome_message": WELCOME_MESSAGE,
         "developer_credit_label": "👨‍💻 Developer Contact",
+        "numbers_per_request": 3,
         "manual_services": [],
         "active_provider": "zenex",
         "enabled_providers": [],
@@ -686,6 +687,18 @@ def get_developer_credit():
         return None
     label = (cfg.get("developer_credit_label") or "").strip() or DEVELOPER_CREDIT_DEFAULT_LABEL
     return label, url
+
+NUMBERS_PER_REQUEST_MAX = 10
+
+def get_numbers_per_request():
+    """How many numbers one GET NUMBER / CHANGE NUMBER click delivers.
+    Admin-set (BOT SETTINGS > SET NUMBERS PER REQUEST); clamped to 1..10;
+    any bad/missing value falls back to 1 (the original behaviour)."""
+    try:
+        n = int(load_settings().get("numbers_per_request", 1))
+    except Exception:
+        return 1
+    return max(1, min(NUMBERS_PER_REQUEST_MAX, n))
 
 def build_welcome_html():
     """Welcome text (HTML-escaped) + clickable developer credit underneath."""
@@ -1497,6 +1510,7 @@ def bot_settings_keyboard():
         [make_reply_btn("LINKS & CHANNELS",   emoji_id="5253742260054409879", style="primary")],
         [make_reply_btn("SET OTP BONUS",      emoji_id="6233367447789899509", style="success"),
          make_reply_btn("SET REFERRAL BONUS", emoji_id="5420396762189831222", style="success")],
+        [make_reply_btn("SET NUMBERS PER REQUEST", emoji_id="5375338737028841420", style="success")],
         [make_reply_btn("SET OTP CHAT ID",    emoji_id="5231200819986047254", style="primary")],
         [make_reply_btn("SET RANGE BROADCAST CHAT ID", emoji_id="5231012545799666522", style="primary")],
         [make_reply_btn("MANAGE TOP HIT RANGES", emoji_id="5231012545799666522", style="success")],
@@ -2271,6 +2285,11 @@ async def fast_allocate_number(query, context, range_text, sid):
         await query.message.edit_text("🚫 YOU ARE BANNED 🚫")
         return
 
+    _count = get_numbers_per_request()
+    if _count > 1:
+        await fast_allocate_multi(query, context, range_text, sid, _count)
+        return
+
     res, clean_num = None, None
     # The API can occasionally hand back a number another concurrent request
     # just claimed — retry a couple of times instead of overwriting ownership.
@@ -2331,6 +2350,73 @@ async def fast_allocate_number(query, context, range_text, sid):
         await query.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
     except Exception as e:
         print(f"fast_allocate edit error: {e}")
+
+async def fast_allocate_multi(query, context, range_text, sid, count):
+    """Same flow as fast_allocate_number, but delivers up to `count` numbers
+    in one message. Each number is reserved via register_active_number, so
+    duplicates are skipped and re-requested (max 2 extra rounds)."""
+    uid = query.from_user.id
+    entries = []
+    try:
+        for _round in range(3):
+            need = count - len(entries)
+            if need <= 0:
+                break
+            results = await asyncio.gather(*[fetch_number_async(range_text) for _ in range(need)], return_exceptions=True)
+            got_any = False
+            for r in results:
+                if isinstance(r, Exception) or not r or not r.get("number"):
+                    continue
+                got_any = True
+                clean = await register_active_number(uid, r["number"], range_text, sid, r.get("provider_id"))
+                if clean:
+                    entries.append({"num": clean, "otp_now": r.get("otp_now", False),
+                                    "otp": r.get("otp"), "sms": r.get("sms")})
+            if not got_any:
+                break
+    except Exception as e:
+        await query.message.edit_text(f"❌ Server error: {str(e)[:100]}")
+        return
+
+    if not entries:
+        await query.message.edit_text(
+            "❌ <b>Number পাওয়া যায়নি।</b>\n\n"
+            "<blockquote>⚠️ এই range-এ এখন number নেই বা server busy।\n"
+            "আরেকটি range চেষ্টা করুন।</blockquote>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 BACK", callback_data="back_services", api_kwargs={"style": "danger"})
+            ]])
+        )
+        return
+
+    add_number_taken(uid, len(entries))
+    last_range[uid] = range_text
+    country_flag, country_name = get_country_info(entries[0]["num"])
+
+    lines = []
+    for e in entries:
+        if e["otp_now"] and e["otp"]:
+            otp_safe = html.escape(str(e["otp"]))
+            sms_safe = html.escape(str(e.get("sms") or ""))
+            add_otp_received(uid)
+            lines.append(
+                f"<blockquote>📞 NUMBER: <code>+{e['num']}</code>\n🔑 OTP: <code>{otp_safe}</code>"
+                + (f"\n📩 SMS: <code>{sms_safe}</code>" if sms_safe else "") + "</blockquote>")
+        else:
+            lines.append(f"<blockquote>📞 NUMBER: <code>+{e['num']}</code></blockquote>")
+    any_instant = any(e["otp_now"] and e["otp"] for e in entries)
+    status = "✅ OTP RECEIVED INSTANTLY!" if any_instant else "📩 SMS STATUS: ⏳ WAITING..."
+    text = (
+        f"✅ <b>YOUR NUMBERS</b> ✅\n\n"
+        f"<blockquote>🌍 COUNTRY: <code>{country_flag} {html.escape(country_name)}</code></blockquote>\n"
+        f"<blockquote>📶 RANGE: <code>{range_text}</code></blockquote>\n\n"
+        + "\n".join(lines) + f"\n\n<b>{status}</b>"
+    )
+    try:
+        await query.message.edit_text(text, parse_mode="HTML", reply_markup=number_result_keyboard())
+    except Exception as e:
+        print(f"fast_allocate_multi edit error: {e}")
 
 async def worker():
     while True:
@@ -3044,7 +3130,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'update': update,
             'context': context,
             'range_text': range_text,
-            'count': 1
+            'count': get_numbers_per_request()
         })
         return
 
@@ -3826,6 +3912,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"📋 <b>FORCE JOIN CHANNELS ({len(channels)})</b>\n\n<blockquote>{lines}</blockquote>",
                 parse_mode="HTML", reply_markup=force_join_keyboard())
+        return
+
+    # ==================== SET NUMBERS PER REQUEST ====================
+    if text == "SET NUMBERS PER REQUEST" and context.user_data.get("bot_settings_mode") == "main" and is_admin(uid):
+        context.user_data["bot_settings_mode"] = "set_numbers_per_request"
+        await update.message.reply_text(
+            f"🔢 <b>SET NUMBERS PER REQUEST</b>\n\n<blockquote>GET NUMBER / CHANGE NUMBER চাপলে একবারে কয়টি নাম্বার দেবে?\n"
+            f"Current: <code>{get_numbers_per_request()}</code></blockquote>\n\n"
+            f"নতুন সংখ্যা দিন (১ থেকে {NUMBERS_PER_REQUEST_MAX}, যেমন <code>3</code>):",
+            parse_mode="HTML", reply_markup=cancel_keyboard())
+        return
+
+    if context.user_data.get("bot_settings_mode") == "set_numbers_per_request" and is_admin(uid):
+        try:
+            n = int(text.strip())
+            if n < 1 or n > NUMBERS_PER_REQUEST_MAX: raise ValueError
+        except ValueError:
+            await update.message.reply_text(f"❌ ১ থেকে {NUMBERS_PER_REQUEST_MAX}-এর মধ্যে একটি পূর্ণ সংখ্যা দিন (যেমন 3)।")
+            return
+        s = load_settings()
+        s["numbers_per_request"] = n
+        save_settings(s)
+        await update.message.reply_text(
+            f"✅ <b>NUMBERS PER REQUEST UPDATED!</b>\n<blockquote>{n} number / request</blockquote>",
+            parse_mode="HTML", reply_markup=bot_settings_keyboard())
+        context.user_data["bot_settings_mode"] = "main"
         return
 
     # ==================== SET OTP BONUS / REFERRAL BONUS ====================
@@ -5229,7 +5341,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ]]))
             except:
                 pass
-            await process_numbers(update, context, r_text, 1)
+            await process_numbers(update, context, r_text, get_numbers_per_request())
         return
 
     # WITHDRAW
