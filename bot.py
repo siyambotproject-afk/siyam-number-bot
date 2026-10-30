@@ -719,24 +719,94 @@ def get_otp_group_url():
 
 _PERMANENT_SEND_ERRORS = ("chat not found", "forbidden", "kicked", "not enough rights", "have no rights", "bot is not a member")
 
-async def forward_otp_to_chat(bot, chat_id, html_text, full_kb, plain_kb):
-    """Send one OTP notice to a group/channel. Tries: full keyboard -> plain
-    keyboard (no icon/style extras, only valid URLs) -> no keyboard, each with
-    and without custom emoji. Returns (ok, error_text)."""
+async def forward_otp_to_chat(bot, chat_id, html_text, full_kb=None, plain_kb=None, variants=None, info=None):
+    """Send one OTP notice to a group/channel, keeping the ORIGINAL button look
+    whenever Telegram accepts it. `variants` is an ordered list of
+    (name, keyboard) — best look first; the first one Telegram accepts wins.
+    Without `variants`: [(full), (plain), (none)]. If `info` (dict) is given it
+    receives {"variant": name_used, "errors": [(name, error), ...]} so callers
+    (e.g. TEST OTP FORWARD) can show exactly why a richer look was rejected.
+    Returns (ok, error_text)."""
+    if variants is None:
+        variants = [("full", full_kb), ("plain", plain_kb), ("none", None)]
+    elif not any(kb is None for _, kb in variants):
+        variants = list(variants) + [("none", None)]
+    errors = []
     last_err = None
     plain_text = _strip_tg_emoji_tags(html_text)
-    for kb in (full_kb, plain_kb, None):
-        for txt in ((html_text, plain_text) if plain_text != html_text else (html_text,)):
-            try:
-                await bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=kb)
-                return True, None
-            except Exception as e:
-                last_err = e
-                if any(k in str(e).lower() for k in _PERMANENT_SEND_ERRORS):
-                    print(f"[otp-forward] chat={chat_id} permanent error: {e}")
-                    return False, str(e)
+    for name, kb in variants:
+        try:
+            await bot.send_message(chat_id, html_text, parse_mode="HTML", reply_markup=kb)
+            if info is not None:
+                info["variant"] = name; info["errors"] = errors
+            return True, None
+        except Exception as e:
+            last_err = e
+            low = str(e).lower()
+            if any(k in low for k in _PERMANENT_SEND_ERRORS):
+                print(f"[otp-forward] chat={chat_id} permanent error: {e}")
+                if info is not None: info["variant"] = None; info["errors"] = errors
+                return False, str(e)
+            # custom-emoji / entity problem in the TEXT -> same keyboard, plain text
+            if plain_text != html_text and any(k in low for k in ("emoji", "entit", "parse")):
+                try:
+                    await bot.send_message(chat_id, plain_text, parse_mode="HTML", reply_markup=kb)
+                    if info is not None:
+                        info["variant"] = name + " (plain text)"; info["errors"] = errors + [(name, str(e))]
+                    return True, None
+                except Exception as e2:
+                    last_err = e2
+            errors.append((name, str(e)))
+            print(f"[otp-forward] chat={chat_id} variant '{name}' rejected: {e}")
+    if info is not None: info["variant"] = None; info["errors"] = errors
     print(f"[otp-forward] chat={chat_id} failed: {last_err}")
     return False, str(last_err)
+
+def _make_otp_copy_button(otp_code, icons=True, styles=True):
+    kw = {}
+    if icons: kw["icon_custom_emoji_id"] = "5296369303661067030"
+    if styles: kw["style"] = "success"
+    if HAS_COPY_BTN:
+        try:
+            return InlineKeyboardButton(text=otp_code, copy_text=CopyTextButton(text=otp_code), api_kwargs=kw)
+        except Exception:
+            pass
+    return InlineKeyboardButton(otp_code, callback_data=f"copy_text_{otp_code}", api_kwargs=kw)
+
+def build_group_otp_keyboard(otp_code, settings, icons=True, styles=True):
+    """The group/channel OTP keyboard — same layout and look as always:
+    [COPY | DEVELOPER] / [NUMBER PANEL | MAIN CHANNEL], each with its premium
+    icon + colour. Only a button whose saved link is not a valid URL is left
+    out (one bad link used to make Telegram reject the WHOLE message)."""
+    dev = _normalize_developer_url(settings.get("developer_link") or DEVELOPER_LINK) or _normalize_developer_url(DEVELOPER_LINK)
+    panel = _normalize_developer_url(settings.get("panel_url", "https://t.me/Zenex_Number_bot?start=8346777366"))
+    chan = _normalize_developer_url(settings.get("channel_url", "https://t.me/MinoXofficial0"))
+    def kw(icon_id, style):
+        d = {}
+        if icons: d["icon_custom_emoji_id"] = icon_id
+        if styles: d["style"] = style
+        return d
+    row1 = [_make_otp_copy_button(otp_code, icons, styles)]
+    if dev:
+        row1.append(InlineKeyboardButton(settings.get("developer_btn_label") or "👨‍💻 DEVELOPER", url=dev,
+                                         api_kwargs=kw("5267294466716244344", "danger")))
+    row2 = []
+    if panel:
+        row2.append(InlineKeyboardButton(settings.get("panel_btn_label") or "📱 NUMBER PANEL", url=panel,
+                                         api_kwargs=kw("4943094697238201446", "primary")))
+    if chan:
+        row2.append(InlineKeyboardButton(settings.get("channel_btn_label") or "📢 MAIN CHANNEL", url=chan,
+                                         api_kwargs=kw("6215074610845585917", "success")))
+    return InlineKeyboardMarkup([row1] + ([row2] if row2 else []))
+
+def group_otp_keyboard_variants(otp_code, settings):
+    """Best look first; each step drops only what Telegram might reject."""
+    return [
+        ("full (icons + colours)", build_group_otp_keyboard(otp_code, settings, True, True)),
+        ("colours only",           build_group_otp_keyboard(otp_code, settings, False, True)),
+        ("icons only",             build_group_otp_keyboard(otp_code, settings, True, False)),
+        ("plain buttons",          build_group_otp_keyboard(otp_code, settings, False, False)),
+    ]
 
 def get_numbers_per_request():
     """How many numbers one GET NUMBER / CHANGE NUMBER click delivers.
@@ -1622,7 +1692,6 @@ def bot_settings_keyboard():
         [make_reply_btn("SET NUMBERS PER REQUEST", emoji_id="5375338737028841420", style="success")],
         [make_reply_btn("OTP FORWARD TARGETS", emoji_id="5231200819986047254", style="success")],
         [make_reply_btn("APP PREMIUM EMOJIS", emoji_id="5231200819986047254", style="success")],
-        [make_reply_btn("SET OTP CHAT ID",    emoji_id="5231200819986047254", style="primary")],
         [make_reply_btn("SET RANGE BROADCAST CHAT ID", emoji_id="5231012545799666522", style="primary")],
         [make_reply_btn("MANAGE TOP HIT RANGES", emoji_id="5231012545799666522", style="success")],
         [make_reply_btn("API PROVIDER CONFIG", emoji_id="5350396951407895212", style="success")],
@@ -1643,7 +1712,6 @@ def links_config_keyboard():
     """One consolidated hub for every link and every join-required channel
     the bot uses — each button says exactly where it's used."""
     keyboard = [
-        [make_reply_btn("OTP GROUP JOIN LINK",     emoji_id="5253742260054409879", style="primary")],
         [make_reply_btn("MAIN CHANNEL BUTTON LINK", emoji_id="6215074610845585917", style="primary")],
         [make_reply_btn("NUMBER PANEL BUTTON LINK", emoji_id="4943094697238201446", style="primary")],
         [make_reply_btn("DEVELOPER BUTTON LINK",   emoji_id="5267294466716244344", style="primary")],
@@ -2253,20 +2321,7 @@ async def monitor_loop(app):
                         purchased_app = details.get("app") or detect_service(full_sms)
                         app_em = get_platform_icon(purchased_app)
 
-                        if HAS_COPY_BTN:
-                            try:
-                                btn_copy = InlineKeyboardButton(
-                                    text=otp_code,
-                                    copy_text=CopyTextButton(text=otp_code),
-                                    api_kwargs={"icon_custom_emoji_id": "5296369303661067030", "style": "success"})
-                            except Exception:
-                                btn_copy = InlineKeyboardButton(
-                                    otp_code, callback_data=f"copy_text_{otp_code}",
-                                    api_kwargs={"icon_custom_emoji_id": "5296369303661067030", "style": "success"})
-                        else:
-                            btn_copy = InlineKeyboardButton(
-                                otp_code, callback_data=f"copy_text_{otp_code}",
-                                api_kwargs={"icon_custom_emoji_id": "5296369303661067030", "style": "success"})
+                        btn_copy = _make_otp_copy_button(otp_code)
 
                         panel_url = settings.get("panel_url", "https://t.me/Zenex_Number_bot?start=8346777366")
                         channel_url = settings.get("channel_url", "https://t.me/MinoXofficial0")
@@ -2299,30 +2354,13 @@ async def monitor_loop(app):
                         # 9.4: primary, success, danger. "secondary" (tried earlier as an
                         # experimental 4th color) is NOT valid and could cause the whole
                         # sendMessage call to be rejected — reusing "success" here instead.
-                        group_kb  = InlineKeyboardMarkup([
-                            [btn_copy,
-                             InlineKeyboardButton(developer_label, url=developer_url,
-                                api_kwargs={"icon_custom_emoji_id": "5267294466716244344", "style": "danger"})],
-                            [InlineKeyboardButton(panel_label, url=panel_url,
-                                api_kwargs={"icon_custom_emoji_id": "4943094697238201446", "style": "primary"}),
-                             InlineKeyboardButton(channel_label, url=channel_url,
-                                api_kwargs={"icon_custom_emoji_id": "6215074610845585917", "style": "success"})]])
 
                         await send_with_emoji_fallback(
                             lambda t: app.bot.send_message(details["uid"], t, parse_mode="HTML", reply_markup=user_kb),
                             user_msg)
-                        # Plain (extras-free) keyboard used if the styled one is rejected.
-                        _plain_rows = [[InlineKeyboardButton(otp_code, callback_data=f"copy_text_{otp_code}")]]
-                        _link_row = []
-                        for _lbl, _u in ((developer_label, developer_url), (panel_label, panel_url), (channel_label, channel_url)):
-                            _nu = _normalize_developer_url(_u)
-                            if _nu:
-                                _link_row.append(InlineKeyboardButton(_lbl, url=_nu))
-                        if _link_row:
-                            _plain_rows.append(_link_row)
-                        group_kb_plain = InlineKeyboardMarkup(_plain_rows)
+                        _variants = group_otp_keyboard_variants(otp_code, settings)
                         for gid in get_otp_forward_chat_ids(settings):
-                            await forward_otp_to_chat(app.bot, gid, group_msg, group_kb, group_kb_plain)
+                            await forward_otp_to_chat(app.bot, gid, group_msg, variants=_variants)
                         save_data(paid_data, PAID_SMS_FILE)
 
             now = datetime.now()
@@ -4127,7 +4165,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📡 <b>OTP FORWARD TARGETS</b>\n\n"
             "<blockquote>গ্রুপ <b>অথবা</b> চ্যানেল — যেকোনোটায় OTP ফরোয়ার্ড হবে। প্রতিটির Chat ID + Join Link দুটোই দিতে হবে। "
             "বট ওই গ্রুপে member এবং চ্যানেলে admin (Post Messages) থাকতে হবে।\n"
-            f"বর্তমান target: <b>{n}</b>" + ("" if n else " (কিছু নেই — পুরোনো SET OTP CHAT ID ব্যবহৃত হচ্ছে)") + "</blockquote>",
+            f"বর্তমান target: <b>{n}</b>"
+            + ("" if n else f" (কিছু নেই — আগের সংরক্ষিত ID <code>{get_otp_forward_chat_ids()[0] if get_otp_forward_chat_ids() else '—'}</code> "
+                            f"ও লিংক ব্যবহৃত হচ্ছে; নতুন target যোগ করলে সেটি বদলে যাবে)") + "</blockquote>",
             parse_mode="HTML", reply_markup=otp_targets_keyboard())
         return
 
@@ -4256,9 +4296,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ কোনো target নেই।", reply_markup=otp_targets_keyboard())
             return
         report = []
+        _cfg = load_settings()
+        _test_msg = (
+            f"{get_tg_emoji('otp_success')} <b>OTP RECEIVED SUCCESSFULLY</b> {get_tg_emoji('otp_success')}\n\n"
+            f"<blockquote>🌍 COUNTRY: {get_country_tg_flag('🇧🇩')} Bangladesh</blockquote>\n"
+            f"<blockquote>{get_platform_icon('WhatsApp')} SERVICE: WhatsApp</blockquote>\n"
+            f"<blockquote>{get_tg_emoji('get_number_btn')} NUMBER: <code>+88017****5678</code></blockquote>\n"
+            f"<blockquote>{get_tg_emoji('key')} OTP: <code>123456</code></blockquote>\n"
+            f"<blockquote>{get_tg_emoji('msg')} FULL SMS: <code>[TEST] Your WhatsApp code is 123456</code></blockquote>\n\n"
+            "🧪 <b>TEST MESSAGE</b>")
         for cid in ids:
-            ok, err = await forward_otp_to_chat(context.bot, cid, "✅ <b>OTP FORWARD TEST</b>\n<blockquote>This chat is connected for OTP forwarding.</blockquote>", None, None)
-            report.append(f"{'✅' if ok else '❌'} <code>{cid}</code>" + ("" if ok else f"\n   ↳ {html.escape(str(err))[:200]}"))
+            _info = {}
+            ok, err = await forward_otp_to_chat(context.bot, cid, _test_msg,
+                                                variants=group_otp_keyboard_variants("123456", _cfg), info=_info)
+            if not ok:
+                report.append(f"❌ <code>{cid}</code>\n   ↳ {html.escape(str(err))[:200]}")
+            elif _info.get("errors") or str(_info.get("variant", "")).startswith(("colours", "icons", "plain", "none")):
+                why = html.escape((_info.get("errors") or [("", "?")])[0][1])[:200]
+                report.append(f"⚠️ <code>{cid}</code> — গেছে, কিন্তু বাটন সরল হয়ে: <b>{html.escape(str(_info.get('variant')))}</b>\n   ↳ Telegram যে কারণে পূর্ণ রূপ নেয়নি: {why}")
+            else:
+                report.append(f"✅ <code>{cid}</code> — বাটনসহ পূর্ণ রূপে গেছে")
         await update.message.reply_text("🧪 <b>TEST RESULT</b>\n\n<blockquote>" + "\n".join(report) + "</blockquote>",
                                         parse_mode="HTML", reply_markup=otp_targets_keyboard())
         return
