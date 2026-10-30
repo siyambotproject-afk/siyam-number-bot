@@ -379,6 +379,9 @@ def load_settings():
         "welcome_message": WELCOME_MESSAGE,
         "developer_credit_label": "👨‍💻 Developer Contact",
         "numbers_per_request": 3,
+        "otp_forward_targets": [],
+        "force_join_meta": {},
+        "app_emoji_overrides": {},
         "manual_services": [],
         "active_provider": "zenex",
         "enabled_providers": [],
@@ -690,6 +693,51 @@ def get_developer_credit():
 
 NUMBERS_PER_REQUEST_MAX = 10
 
+# ---- OTP forward targets (groups AND/OR channels; each has chat id + link) ----
+def get_otp_forward_targets():
+    t = load_settings().get("otp_forward_targets") or []
+    return [x for x in t if isinstance(x, dict) and x.get("chat_id") not in (None, "")]
+
+def get_otp_forward_chat_ids(settings=None):
+    """Chat ids OTPs are forwarded to. New multi-target list first; if it is
+    empty, the old single-id behaviour (otp_group_chat_id / OTP_GROUP_ID)."""
+    targets = get_otp_forward_targets()
+    if targets:
+        return [x["chat_id"] for x in targets]
+    cfg = settings if settings is not None else load_settings()
+    legacy = cfg.get("otp_group_chat_id") or OTP_GROUP_ID
+    return [legacy] if legacy else []
+
+def get_otp_group_url():
+    """Join link behind the OTP GROUP button: first target that has a link,
+    else the old otp_group_url setting."""
+    for x in get_otp_forward_targets():
+        u = _normalize_developer_url(x.get("link"))
+        if u:
+            return u
+    return load_settings().get("otp_group_url") or "https://t.me/+31eV11IT7WQzMjI9"
+
+_PERMANENT_SEND_ERRORS = ("chat not found", "forbidden", "kicked", "not enough rights", "have no rights", "bot is not a member")
+
+async def forward_otp_to_chat(bot, chat_id, html_text, full_kb, plain_kb):
+    """Send one OTP notice to a group/channel. Tries: full keyboard -> plain
+    keyboard (no icon/style extras, only valid URLs) -> no keyboard, each with
+    and without custom emoji. Returns (ok, error_text)."""
+    last_err = None
+    plain_text = _strip_tg_emoji_tags(html_text)
+    for kb in (full_kb, plain_kb, None):
+        for txt in ((html_text, plain_text) if plain_text != html_text else (html_text,)):
+            try:
+                await bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=kb)
+                return True, None
+            except Exception as e:
+                last_err = e
+                if any(k in str(e).lower() for k in _PERMANENT_SEND_ERRORS):
+                    print(f"[otp-forward] chat={chat_id} permanent error: {e}")
+                    return False, str(e)
+    print(f"[otp-forward] chat={chat_id} failed: {last_err}")
+    return False, str(last_err)
+
 def get_numbers_per_request():
     """How many numbers one GET NUMBER / CHANGE NUMBER click delivers.
     Admin-set (BOT SETTINGS > SET NUMBERS PER REQUEST); clamped to 1..10;
@@ -764,10 +812,13 @@ def get_top_hit_ranges(limit=10, minutes=RANGE_HIT_WINDOW_MINUTES):
 # ==================== ZENEXA RANGES CACHE ====================
 _ranges_cache = {"data": None, "updated_at": 0.0, "fetching": False}
 
-def get_app_emoji_id(app_name):
-    n = app_name.lower()
-    # Ordered: longer/more-specific names first to avoid partial-match errors
-    SERVICE_EMOJI_MAP = [
+# Ordered: longer/more-specific names first to avoid partial-match errors.
+# NOTE: "5336879280578138635" was ONE shared placeholder used for many different
+# apps (so they all looked identical). It is now treated as "no premium emoji
+# set" — admins can set a real one per app (BOT SETTINGS > APP PREMIUM EMOJIS).
+_SHARED_PLACEHOLDER_EMOJI_ID = "5336879280578138635"
+_SERVICE_EMOJI_MAP = [
+        ("nagad",             "5352985330628730418"),
         ("whatsapp business", "5336814486701514414"),
         ("whatsapp",          "5334759662677957452"),
         ("telegram",          "5337010556253543833"),
@@ -824,13 +875,71 @@ def get_app_emoji_id(app_name):
         ("duolingo",          "5336879280578138635"),
         ("rocket",            "5346042941196507141"),
     ]
-    for k, v in SERVICE_EMOJI_MAP:
+# Distinct plain emoji per app — shown where no premium emoji is set (and as the
+# fallback for users who can't see premium emoji). Every entry is unique.
+_APP_FALLBACK_CHARS = {
+    "daraz": "🛒", "foodpanda": "🍔", "pathao": "🛵", "aliexpress": "📦", "shopee": "🛍️",
+    "payoneer": "🏦", "wise": "💱", "notion": "📝", "figma": "🎨", "upwork": "💼",
+    "fiverr": "🟢", "yahoo": "📧", "dropbox": "🗂️", "coursera": "🎓", "duolingo": "🦉",
+    "messenger": "🗨️", "coinbase": "🪙", "stripe": "💳", "pubg": "🎯", "free fire": "🔥",
+    "twitter": "🐦", "snapchat": "👻", "linkedin": "👔", "amazon": "📫",
+    "google": "🔍", "microsoft": "🪟", "apple": "🍎", "uber": "🚕", "netflix": "🎬",
+    "spotify": "🎧", "viber": "📞", "signal": "🔒", "line": "🟩", "wechat": "🗯️",
+    "reddit": "👽", "pinterest": "📌", "twitch": "🎮", "zoom": "🎥", "slack": "💠",
+    "skype": "☁️", "github": "🐙", "canva": "🖌️", "chatgpt": "🤖", "bybit": "🟧",
+    "melbet": "🎰", "hoichoi": "📺", "teams": "👥",
+}
+_APP_FALLBACK_PALETTE = ["🔹", "🔸", "🟣", "🟠", "🔶", "🔷", "🟤", "💠", "🟡", "⚪", "🔘", "🟥"]
+
+def _resolve_app_emoji(app_name):
+    """(premium_emoji_id or "", source) — source is override / builtin / none."""
+    n = str(app_name or "").lower()
+    try:
+        ov = load_settings().get("app_emoji_overrides") or {}
+    except Exception:
+        ov = {}
+    for k in sorted(ov, key=len, reverse=True):
+        if k and k in n and ov[k]:
+            return str(ov[k]), "override"
+    for k, v in _SERVICE_EMOJI_MAP:
         if k in n:
+            if v == _SHARED_PLACEHOLDER_EMOJI_ID:
+                return "", "none"
+            return v, "builtin"
+    return "", "none"
+
+def get_app_emoji_id(app_name):
+    """Premium custom-emoji id for an app, or "" when none is set."""
+    return _resolve_app_emoji(app_name)[0]
+
+def get_app_fallback_char(app_name):
+    n = str(app_name or "").lower()
+    for k in sorted(_APP_FALLBACK_CHARS, key=len, reverse=True):
+        if k in n:
+            return _APP_FALLBACK_CHARS[k]
+    for k, v in FALLBACK_EMOJI_MAP.items():
+        if k in ("telegram", "instagram", "facebook", "tiktok", "whatsapp", "nagad", "bkash", "binance", "paypal", "imo") and k in n:
             return v
-    return "5861680977994060034"
+    import zlib
+    return _APP_FALLBACK_PALETTE[zlib.crc32(n.encode("utf-8")) % len(_APP_FALLBACK_PALETTE)]
 
 def get_platform_icon(platform_name):
-    return f'<tg-emoji emoji-id="{get_app_emoji_id(platform_name)}">📞</tg-emoji>'
+    ch = get_app_fallback_char(platform_name)
+    eid = get_app_emoji_id(platform_name)
+    if eid:
+        return f'<tg-emoji emoji-id="{eid}">{ch}</tg-emoji>'
+    return ch
+
+def app_button_kwargs(app_name, style):
+    kw = {"style": style}
+    eid = get_app_emoji_id(app_name)
+    if eid:
+        kw["icon_custom_emoji_id"] = eid
+    return kw
+
+def app_button_text(app_name):
+    t = make_bold_text(app_name)
+    return t if get_app_emoji_id(app_name) else f"{get_app_fallback_char(app_name)} {t}"
 
 def get_clean_app_name(raw):
     n = raw.lower().strip()
@@ -981,9 +1090,9 @@ def build_app_buttons_from_cache(top):
     btns, row, ci = [], [], 0
     clrs = ["primary", "success", "danger"]
     for app_name in top:
-        row.append(InlineKeyboardButton(make_bold_text(app_name),
+        row.append(InlineKeyboardButton(app_button_text(app_name),
             callback_data=f"sel_app_{app_name}",
-            api_kwargs={"icon_custom_emoji_id": get_app_emoji_id(app_name), "style": clrs[ci % 3]}))
+            api_kwargs=app_button_kwargs(app_name, clrs[ci % 3])))
         ci += 1
         if len(row) == 2: btns.append(row); row = []
     if row: btns.append(row)
@@ -1511,6 +1620,8 @@ def bot_settings_keyboard():
         [make_reply_btn("SET OTP BONUS",      emoji_id="6233367447789899509", style="success"),
          make_reply_btn("SET REFERRAL BONUS", emoji_id="5420396762189831222", style="success")],
         [make_reply_btn("SET NUMBERS PER REQUEST", emoji_id="5375338737028841420", style="success")],
+        [make_reply_btn("OTP FORWARD TARGETS", emoji_id="5231200819986047254", style="success")],
+        [make_reply_btn("APP PREMIUM EMOJIS", emoji_id="5231200819986047254", style="success")],
         [make_reply_btn("SET OTP CHAT ID",    emoji_id="5231200819986047254", style="primary")],
         [make_reply_btn("SET RANGE BROADCAST CHAT ID", emoji_id="5231012545799666522", style="primary")],
         [make_reply_btn("MANAGE TOP HIT RANGES", emoji_id="5231012545799666522", style="success")],
@@ -1554,6 +1665,25 @@ def rename_buttons_keyboard():
         [make_reply_btn("RENAME: DEVELOPER NAME",    emoji_id="5267294466716244344", style="primary")],
         [make_reply_btn("RENAME: DEVELOPER CREDIT",  emoji_id="5267294466716244344", style="primary")],
         [make_reply_btn("BACK TO LINKS & CHANNELS",  emoji_id="5267490665117275176", style="danger")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+def app_emoji_keyboard():
+    keyboard = [
+        [make_reply_btn("SET APP EMOJI",    emoji_id="5397916757333654639", style="success")],
+        [make_reply_btn("REMOVE APP EMOJI", emoji_id="5244837092042750681", style="danger")],
+        [make_reply_btn("LIST APP EMOJIS",  emoji_id="5231200819986047254", style="primary")],
+        [make_reply_btn("BACK TO BOT SETTINGS", emoji_id="5267490665117275176", style="danger")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+def otp_targets_keyboard():
+    keyboard = [
+        [make_reply_btn("ADD OTP TARGET",    emoji_id="5397916757333654639", style="success")],
+        [make_reply_btn("REMOVE OTP TARGET", emoji_id="5244837092042750681", style="danger")],
+        [make_reply_btn("LIST OTP TARGETS",  emoji_id="5231200819986047254", style="primary")],
+        [make_reply_btn("TEST OTP FORWARD",  emoji_id="5231200819986047254", style="primary")],
+        [make_reply_btn("BACK TO BOT SETTINGS", emoji_id="5267490665117275176", style="danger")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -1617,7 +1747,7 @@ def number_result_keyboard():
     below (styled like LEADERBOARD). OTP group link/label are admin-editable
     via Admin Panel > BOT SETTINGS > LINKS & CHANNELS."""
     s = load_settings()
-    otp_url = s.get("otp_group_url") or "https://t.me/+31eV11IT7WQzMjI9"
+    otp_url = get_otp_group_url()
     otp_label = s.get("otp_group_btn_label") or "📢 OTP GROUP"
     return InlineKeyboardMarkup([
         [
@@ -1967,9 +2097,9 @@ def build_manual_service_buttons():
     clrs = ["primary", "success", "danger"]
     for i, svc in enumerate(manual):
         btns.append(InlineKeyboardButton(
-            make_bold_text(svc['name']),
+            app_button_text(svc['name']),
             callback_data=f"manual_svc_{i}",
-            api_kwargs={"icon_custom_emoji_id": get_app_emoji_id(svc['name']), "style": clrs[i % 3]}
+            api_kwargs=app_button_kwargs(svc['name'], clrs[i % 3])
         ))
     rows = [btns[j:j+2] for j in range(0, len(btns), 2)]
     return rows
@@ -2181,10 +2311,18 @@ async def monitor_loop(app):
                         await send_with_emoji_fallback(
                             lambda t: app.bot.send_message(details["uid"], t, parse_mode="HTML", reply_markup=user_kb),
                             user_msg)
-                        gid = settings.get("otp_group_chat_id") or OTP_GROUP_ID
-                        await send_with_emoji_fallback(
-                            lambda t: app.bot.send_message(gid, t, parse_mode="HTML", reply_markup=group_kb),
-                            group_msg)
+                        # Plain (extras-free) keyboard used if the styled one is rejected.
+                        _plain_rows = [[InlineKeyboardButton(otp_code, callback_data=f"copy_text_{otp_code}")]]
+                        _link_row = []
+                        for _lbl, _u in ((developer_label, developer_url), (panel_label, panel_url), (channel_label, channel_url)):
+                            _nu = _normalize_developer_url(_u)
+                            if _nu:
+                                _link_row.append(InlineKeyboardButton(_lbl, url=_nu))
+                        if _link_row:
+                            _plain_rows.append(_link_row)
+                        group_kb_plain = InlineKeyboardMarkup(_plain_rows)
+                        for gid in get_otp_forward_chat_ids(settings):
+                            await forward_otp_to_chat(app.bot, gid, group_msg, group_kb, group_kb_plain)
                         save_data(paid_data, PAID_SMS_FILE)
 
             now = datetime.now()
@@ -3843,8 +3981,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "ADD CHANNEL" and context.user_data.get("bot_settings_mode") == "fj_main" and is_admin(uid):
         context.user_data["bot_settings_mode"] = "fj_add"
         await update.message.reply_text(
-            "➕ <b>ADD FORCE JOIN CHANNEL</b>\n\n"
-            "চ্যানেল/গ্রুপের username (যেমন <code>@mychannel</code>) অথবা numeric chat id দিন:",
+            "➕ <b>ADD FORCE JOIN CHANNEL / GROUP</b>\n\n"
+            "ধাপ ১/৩: চ্যানেল <b>বা</b> গ্রুপের username (যেমন <code>@mychannel</code>) অথবা numeric chat id "
+            "(যেমন <code>-1001234567890</code>) দিন:",
             parse_mode="HTML", reply_markup=cancel_keyboard())
         return
 
@@ -3856,15 +3995,72 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         channels = s.get("force_join_channels", [])
         if val in channels:
             await update.message.reply_text("⚠️ এটা আগে থেকেই লিস্টে আছে!", reply_markup=force_join_keyboard())
-        else:
-            channels.append(val)
-            s["force_join_channels"] = channels
-            save_settings(s)
+            context.user_data["bot_settings_mode"] = "fj_main"
+            return
+        # Membership checks only work if the bot can see the chat — otherwise
+        # EVERY user would be treated as "not joined" and locked out. So verify first.
+        _key = int(val) if val.lstrip("-").isdigit() else val
+        try:
+            chat = await context.bot.get_chat(_key)
+            me = await context.bot.get_chat_member(_key, context.bot.id)
+            if me.status in ("left", "kicked"):
+                raise RuntimeError("bot is not a member of this chat")
+        except Exception as e:
             await update.message.reply_text(
-                f"✅ <b>CHANNEL ADDED!</b>\n<blockquote>{html.escape(val)}</blockquote>\n\n"
-                f"বট এখন থেকে সব ব্যবহারকারীকে এই চ্যানেলেও জয়েন করতে বলবে।",
-                parse_mode="HTML", reply_markup=force_join_keyboard())
+                f"❌ <b>যোগ করা যায়নি — বট এই চ্যাটে অ্যাক্সেস পাচ্ছে না।</b>\n<blockquote>{html.escape(str(e))[:200]}</blockquote>\n"
+                "বটকে চ্যানেলে admin / গ্রুপে যোগ করুন (member চেক করতে এটা লাগে), তারপর আবার ID দিন।",
+                parse_mode="HTML")
+            return
+        _dl = f"https://t.me/{chat.username}" if getattr(chat, "username", None) else (getattr(chat, "invite_link", None) or "")
+        context.user_data["fj_pending"] = {"key": val, "title": getattr(chat, "title", None) or val.lstrip("@"), "default_link": _dl}
+        context.user_data["bot_settings_mode"] = "fj_add_link"
+        hint = (f"SKIP দিলে এটি ব্যবহার হবে: <code>{html.escape(_dl)}</code>" if _dl
+                else "(এই চ্যাটের পাবলিক লিংক নেই, তাই লিংক দেওয়া বাধ্যতামূলক)")
+        await update.message.reply_text(
+            f"✅ পাওয়া গেছে: <b>{html.escape(context.user_data['fj_pending']['title'])}</b>\n\n"
+            f"ধাপ ২/৩: ইউজারের <b>Join Link</b> দিন (যেমন <code>https://t.me/+AbCd...</code>)।\n{hint}",
+            parse_mode="HTML", reply_markup=cancel_keyboard())
+        return
+
+    if context.user_data.get("bot_settings_mode") == "fj_add_link" and is_admin(uid):
+        pend = context.user_data.get("fj_pending") or {}
+        raw = text.strip()
+        link = _normalize_developer_url(pend.get("default_link") if raw.upper() == "SKIP" else raw)
+        if not link:
+            await update.message.reply_text("❌ বৈধ লিংক দিন (https://t.me/...)" + (" — এই চ্যাটের জন্য SKIP চলবে না।" if raw.upper() == "SKIP" else ""))
+            return
+        pend["link"] = link
+        context.user_data["fj_pending"] = pend
+        context.user_data["bot_settings_mode"] = "fj_add_label"
+        await update.message.reply_text(
+            "ধাপ ৩/৩: ইউজারের কাছে <b>বাটনের নাম</b> কী দেখাবে? (যেমন <code>📢 OUR CHANNEL</code>)\n"
+            f"SKIP দিলে ডিফল্ট: <code>✅ JOIN {html.escape(pend.get('title',''))}</code>",
+            parse_mode="HTML", reply_markup=cancel_keyboard())
+        return
+
+    if context.user_data.get("bot_settings_mode") == "fj_add_label" and is_admin(uid):
+        pend = context.user_data.get("fj_pending") or {}
+        label = text.strip()
+        if label.upper() == "SKIP":
+            label = ""
+        if len(label) > 60:
+            await update.message.reply_text("❌ বাটনের নাম ৬০ অক্ষরের মধ্যে দিন।")
+            return
+        s = load_settings()
+        channels = s.get("force_join_channels", [])
+        channels.append(pend["key"])
+        s["force_join_channels"] = channels
+        meta = dict(s.get("force_join_meta") or {})
+        meta[pend["key"]] = {"label": label, "link": pend.get("link", ""), "title": pend.get("title", "")}
+        s["force_join_meta"] = meta
+        save_settings(s)
+        context.user_data.pop("fj_pending", None)
         context.user_data["bot_settings_mode"] = "fj_main"
+        await update.message.reply_text(
+            f"✅ <b>ADDED!</b>\n<blockquote>{html.escape(pend['key'])} — {html.escape(pend.get('title',''))}\n"
+            f"বাটন: {html.escape(label or '✅ JOIN ' + pend.get('title',''))}\nLink: {html.escape(pend.get('link',''))}</blockquote>\n\n"
+            f"বট এখন থেকে সব ব্যবহারকারীকে এটিতেও জয়েন করতে বলবে।",
+            parse_mode="HTML", reply_markup=force_join_keyboard(), disable_web_page_preview=True)
         return
 
     if text == "REMOVE CHANNEL" and context.user_data.get("bot_settings_mode") == "fj_main" and is_admin(uid):
@@ -3895,6 +4091,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # also clear legacy single-channel key if it matches, so it doesn't get re-migrated back in
         if s.get("force_join_channel") == removed:
             s["force_join_channel"] = None
+        _m = dict(s.get("force_join_meta") or {})
+        _m.pop(str(removed), None)
+        s["force_join_meta"] = _m
         save_settings(s)
         await update.message.reply_text(
             f"✅ <b>CHANNEL REMOVED!</b>\n<blockquote>{html.escape(str(removed))}</blockquote>",
@@ -3908,10 +4107,265 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not channels:
             await update.message.reply_text("📋 কোনো চ্যানেল যোগ করা নেই — force join বন্ধ আছে।", reply_markup=force_join_keyboard())
         else:
-            lines = "\n".join(f"{i+1}. <code>{html.escape(str(c))}</code>" for i, c in enumerate(channels))
+            _fm = s.get("force_join_meta") or {}
+            def _fj_line(i, c):
+                m = _fm.get(str(c)) or {}
+                extra = (f"\n   বাটন: {html.escape(m.get('label') or '(default)')} | {html.escape(m.get('link') or '')}" if m else "")
+                return f"{i+1}. <code>{html.escape(str(c))}</code>{extra}"
+            lines = "\n".join(_fj_line(i, c) for i, c in enumerate(channels))
             await update.message.reply_text(
                 f"📋 <b>FORCE JOIN CHANNELS ({len(channels)})</b>\n\n<blockquote>{lines}</blockquote>",
                 parse_mode="HTML", reply_markup=force_join_keyboard())
+        return
+
+    # ==================== OTP FORWARD TARGETS (group / channel: ID + link) ====================
+    _otm = context.user_data.get("bot_settings_mode")
+    if text == "OTP FORWARD TARGETS" and _otm == "main" and is_admin(uid):
+        context.user_data["bot_settings_mode"] = "otpt_main"
+        n = len(get_otp_forward_targets())
+        await update.message.reply_text(
+            "📡 <b>OTP FORWARD TARGETS</b>\n\n"
+            "<blockquote>গ্রুপ <b>অথবা</b> চ্যানেল — যেকোনোটায় OTP ফরোয়ার্ড হবে। প্রতিটির Chat ID + Join Link দুটোই দিতে হবে। "
+            "বট ওই গ্রুপে member এবং চ্যানেলে admin (Post Messages) থাকতে হবে।\n"
+            f"বর্তমান target: <b>{n}</b>" + ("" if n else " (কিছু নেই — পুরোনো SET OTP CHAT ID ব্যবহৃত হচ্ছে)") + "</blockquote>",
+            parse_mode="HTML", reply_markup=otp_targets_keyboard())
+        return
+
+    if text == "ADD OTP TARGET" and _otm == "otpt_main" and is_admin(uid):
+        context.user_data["bot_settings_mode"] = "otpt_add_id"
+        await update.message.reply_text(
+            "➕ <b>ADD OTP TARGET</b>\n\nধাপ ১/২: গ্রুপ/চ্যানেলের <b>Chat ID</b> দিন (যেমন <code>-1001234567890</code>) "
+            "অথবা পাবলিক হলে <code>@username</code>:",
+            parse_mode="HTML", reply_markup=cancel_keyboard())
+        return
+
+    if _otm == "otpt_add_id" and is_admin(uid):
+        val = text.strip()
+        if val.lstrip("-").isdigit():
+            chat_key = int(val)
+        elif re.fullmatch(r"@[A-Za-z0-9_]{4,}", val):
+            chat_key = val
+        else:
+            await update.message.reply_text("❌ Chat ID (যেমন -1001234567890) অথবা @username দিন।")
+            return
+        if any(str(x["chat_id"]) == str(chat_key) for x in get_otp_forward_targets()):
+            await update.message.reply_text("⚠️ এটা আগে থেকেই লিস্টে আছে!", reply_markup=otp_targets_keyboard())
+            context.user_data["bot_settings_mode"] = "otpt_main"
+            return
+        try:
+            chat = await context.bot.get_chat(chat_key)
+        except Exception as e:
+            await update.message.reply_text(
+                f"❌ <b>বট এই চ্যাটে অ্যাক্সেস পাচ্ছে না।</b>\n<blockquote>{html.escape(str(e))}</blockquote>\n"
+                "ID ঠিক আছে কিনা এবং বটকে গ্রুপে যোগ / চ্যানেলে admin করা হয়েছে কিনা দেখুন, তারপর আবার ID দিন।",
+                parse_mode="HTML")
+            return
+        warn = ""
+        try:
+            me = await context.bot.get_chat_member(chat_key, context.bot.id)
+            if me.status in ("left", "kicked"):
+                await update.message.reply_text("❌ বট এই চ্যাটে member নেই। আগে বটকে যোগ করুন, তারপর আবার ID দিন।")
+                return
+            if getattr(chat, "type", "") == "channel" and me.status not in ("administrator", "creator"):
+                warn = "\n⚠️ চ্যানেলে বট admin না — Post Messages permission দিন, নইলে OTP যাবে না।"
+        except Exception as e:
+            warn = f"\n⚠️ বটের permission যাচাই করা যায়নি: {html.escape(str(e))[:120]}"
+        _dl = ""
+        if getattr(chat, "username", None):
+            _dl = f"https://t.me/{chat.username}"
+        elif getattr(chat, "invite_link", None):
+            _dl = chat.invite_link
+        context.user_data["otpt_pending"] = {
+            "chat_id": chat_key, "title": getattr(chat, "title", None) or str(chat_key),
+            "type": getattr(chat, "type", ""), "default_link": _dl}
+        context.user_data["bot_settings_mode"] = "otpt_add_link"
+        hint = (f"\nSKIP দিলে এটি ব্যবহার হবে: <code>{html.escape(_dl)}</code>" if _dl
+                else "\n(এই চ্যাটের পাবলিক লিংক নেই, তাই লিংক দেওয়া বাধ্যতামূলক)")
+        await update.message.reply_text(
+            f"✅ পাওয়া গেছে: <b>{html.escape(context.user_data['otpt_pending']['title'])}</b> ({html.escape(str(chat.type))}){warn}\n\n"
+            f"ধাপ ২/২: এই গ্রুপ/চ্যানেলের <b>Join Link</b> দিন (যেমন <code>https://t.me/+AbCd...</code>)।{hint}",
+            parse_mode="HTML", reply_markup=cancel_keyboard())
+        return
+
+    if _otm == "otpt_add_link" and is_admin(uid):
+        pend = context.user_data.get("otpt_pending") or {}
+        raw = text.strip()
+        if raw.upper() == "SKIP":
+            link = _normalize_developer_url(pend.get("default_link"))
+        else:
+            link = _normalize_developer_url(raw)
+        if not link:
+            await update.message.reply_text("❌ বৈধ লিংক দিন (https://t.me/...)" + ("" if raw.upper() != "SKIP" else " — এই চ্যাটের জন্য SKIP চলবে না।"))
+            return
+        s = load_settings()
+        targets = list(s.get("otp_forward_targets") or [])
+        targets.append({"chat_id": pend.get("chat_id"), "link": link,
+                        "title": pend.get("title", ""), "type": pend.get("type", "")})
+        s["otp_forward_targets"] = targets
+        save_settings(s)
+        context.user_data.pop("otpt_pending", None)
+        context.user_data["bot_settings_mode"] = "otpt_main"
+        await update.message.reply_text(
+            f"✅ <b>OTP TARGET ADDED!</b>\n<blockquote>{html.escape(pend.get('title',''))}\n"
+            f"ID: <code>{pend.get('chat_id')}</code>\nLink: {html.escape(link)}</blockquote>\n"
+            "'TEST OTP FORWARD' চেপে যাচাই করে নিন।",
+            parse_mode="HTML", reply_markup=otp_targets_keyboard())
+        return
+
+    if text == "LIST OTP TARGETS" and _otm == "otpt_main" and is_admin(uid):
+        ts = get_otp_forward_targets()
+        if not ts:
+            await update.message.reply_text("📋 কোনো target নেই। (পুরোনো SET OTP CHAT ID ব্যবহৃত হচ্ছে)", reply_markup=otp_targets_keyboard())
+        else:
+            lines = "\n\n".join(
+                f"{i+1}. <b>{html.escape(str(t.get('title') or ''))}</b> ({html.escape(str(t.get('type') or ''))})\n"
+                f"ID: <code>{t['chat_id']}</code>\nLink: {html.escape(str(t.get('link') or '—'))}"
+                for i, t in enumerate(ts))
+            await update.message.reply_text(f"📋 <b>OTP TARGETS ({len(ts)})</b>\n\n<blockquote>{lines}</blockquote>",
+                                            parse_mode="HTML", reply_markup=otp_targets_keyboard(), disable_web_page_preview=True)
+        return
+
+    if text == "REMOVE OTP TARGET" and _otm == "otpt_main" and is_admin(uid):
+        ts = get_otp_forward_targets()
+        if not ts:
+            await update.message.reply_text("📋 কোনো target নেই।", reply_markup=otp_targets_keyboard())
+            return
+        lines = "\n".join(f"{i+1}. {html.escape(str(t.get('title') or t['chat_id']))} — <code>{t['chat_id']}</code>" for i, t in enumerate(ts))
+        context.user_data["bot_settings_mode"] = "otpt_remove"
+        await update.message.reply_text(f"➖ <b>REMOVE OTP TARGET</b>\n\n<blockquote>{lines}</blockquote>\n\nনম্বর দিন:",
+                                        parse_mode="HTML", reply_markup=cancel_keyboard())
+        return
+
+    if _otm == "otpt_remove" and is_admin(uid):
+        s = load_settings()
+        targets = list(s.get("otp_forward_targets") or [])
+        if not text.strip().isdigit() or not (1 <= int(text.strip()) <= len(targets)):
+            await update.message.reply_text(f"❌ 1-{len(targets)} এর মধ্যে নম্বর দিন।")
+            return
+        removed = targets.pop(int(text.strip()) - 1)
+        s["otp_forward_targets"] = targets
+        save_settings(s)
+        context.user_data["bot_settings_mode"] = "otpt_main"
+        await update.message.reply_text(f"✅ <b>REMOVED!</b>\n<blockquote>{html.escape(str(removed.get('title') or removed.get('chat_id')))}</blockquote>",
+                                        parse_mode="HTML", reply_markup=otp_targets_keyboard())
+        return
+
+    if text == "TEST OTP FORWARD" and _otm == "otpt_main" and is_admin(uid):
+        ids = get_otp_forward_chat_ids()
+        if not ids:
+            await update.message.reply_text("⚠️ কোনো target নেই।", reply_markup=otp_targets_keyboard())
+            return
+        report = []
+        for cid in ids:
+            ok, err = await forward_otp_to_chat(context.bot, cid, "✅ <b>OTP FORWARD TEST</b>\n<blockquote>This chat is connected for OTP forwarding.</blockquote>", None, None)
+            report.append(f"{'✅' if ok else '❌'} <code>{cid}</code>" + ("" if ok else f"\n   ↳ {html.escape(str(err))[:200]}"))
+        await update.message.reply_text("🧪 <b>TEST RESULT</b>\n\n<blockquote>" + "\n".join(report) + "</blockquote>",
+                                        parse_mode="HTML", reply_markup=otp_targets_keyboard())
+        return
+
+    # ==================== APP PREMIUM EMOJIS (per-app premium emoji) ====================
+    _aem = context.user_data.get("bot_settings_mode")
+    if text == "APP PREMIUM EMOJIS" and _aem == "main" and is_admin(uid):
+        context.user_data["bot_settings_mode"] = "appem_main"
+        await update.message.reply_text(
+            "✨ <b>APP PREMIUM EMOJIS</b>\n\n"
+            "<blockquote>প্রতিটি অ্যাপ/সার্ভিসের (Daraz, Nagad, Messenger…) নামের পাশে আলাদা premium emoji সেট করুন। "
+            "SET চেপে অ্যাপের নাম দিন, তারপর সেই premium emoji-টি সরাসরি পাঠিয়ে দিন (Telegram Premium লাগবে) — "
+            "অথবা তার numeric custom-emoji ID।</blockquote>",
+            parse_mode="HTML", reply_markup=app_emoji_keyboard())
+        return
+
+    if text == "SET APP EMOJI" and _aem == "appem_main" and is_admin(uid):
+        context.user_data["bot_settings_mode"] = "appem_name"
+        await update.message.reply_text("ধাপ ১/২: অ্যাপ/সার্ভিসের নাম দিন (যেমন <code>Daraz</code>):",
+                                        parse_mode="HTML", reply_markup=cancel_keyboard())
+        return
+
+    if _aem == "appem_name" and is_admin(uid):
+        nm = text.strip().lower()
+        if not nm or len(nm) > 40:
+            await update.message.reply_text("❌ ১-৪০ অক্ষরের একটি নাম দিন।")
+            return
+        context.user_data["appem_pending"] = nm
+        context.user_data["bot_settings_mode"] = "appem_value"
+        await update.message.reply_text(
+            f"ধাপ ২/২: <b>{html.escape(nm)}</b>-এর জন্য premium emoji পাঠান (emoji নিজেই, অথবা numeric ID):",
+            parse_mode="HTML", reply_markup=cancel_keyboard())
+        return
+
+    if _aem == "appem_value" and is_admin(uid):
+        nm = context.user_data.get("appem_pending", "")
+        eid = ""
+        for ent in (getattr(update.message, "entities", None) or []):
+            if getattr(ent, "type", "") == "custom_emoji" and getattr(ent, "custom_emoji_id", None):
+                eid = str(ent.custom_emoji_id)
+                break
+        if not eid and text.strip().isdigit() and 10 <= len(text.strip()) <= 25:
+            eid = text.strip()
+        if not eid:
+            await update.message.reply_text("❌ কোনো premium emoji পাওয়া যায়নি। premium emoji পাঠান অথবা numeric ID দিন।")
+            return
+        s = load_settings()
+        ov = dict(s.get("app_emoji_overrides") or {})
+        ov[nm] = eid
+        s["app_emoji_overrides"] = ov
+        save_settings(s)
+        context.user_data.pop("appem_pending", None)
+        context.user_data["bot_settings_mode"] = "appem_main"
+        await update.message.reply_text(
+            f"✅ <b>SAVED!</b>\n<blockquote>{html.escape(nm)} → <code>{eid}</code>\nPreview: {get_platform_icon(nm)} <b>{html.escape(nm.upper())}</b></blockquote>",
+            parse_mode="HTML", reply_markup=app_emoji_keyboard())
+        return
+
+    if text == "REMOVE APP EMOJI" and _aem == "appem_main" and is_admin(uid):
+        ov = load_settings().get("app_emoji_overrides") or {}
+        if not ov:
+            await update.message.reply_text("📋 কোনো কাস্টম emoji সেট করা নেই।", reply_markup=app_emoji_keyboard())
+            return
+        lines = "\n".join(f"{i+1}. {html.escape(k)} → <code>{v}</code>" for i, (k, v) in enumerate(ov.items()))
+        context.user_data["bot_settings_mode"] = "appem_remove"
+        await update.message.reply_text(f"➖ <b>REMOVE APP EMOJI</b>\n\n<blockquote>{lines}</blockquote>\n\nনম্বর দিন:",
+                                        parse_mode="HTML", reply_markup=cancel_keyboard())
+        return
+
+    if _aem == "appem_remove" and is_admin(uid):
+        s = load_settings()
+        ov = dict(s.get("app_emoji_overrides") or {})
+        keys = list(ov.keys())
+        if not text.strip().isdigit() or not (1 <= int(text.strip()) <= len(keys)):
+            await update.message.reply_text(f"❌ 1-{len(keys)} এর মধ্যে নম্বর দিন।")
+            return
+        removed = keys[int(text.strip()) - 1]
+        ov.pop(removed, None)
+        s["app_emoji_overrides"] = ov
+        save_settings(s)
+        context.user_data["bot_settings_mode"] = "appem_main"
+        await update.message.reply_text(f"✅ <b>REMOVED!</b> <code>{html.escape(removed)}</code>", parse_mode="HTML", reply_markup=app_emoji_keyboard())
+        return
+
+    if text == "LIST APP EMOJIS" and _aem == "appem_main" and is_admin(uid):
+        s = load_settings()
+        ov = s.get("app_emoji_overrides") or {}
+        names = []
+        try:
+            names += list((_ranges_cache.get("data") or {}).keys())
+        except Exception:
+            pass
+        names += [m.get("name", "") for m in (s.get("manual_services") or []) if isinstance(m, dict)]
+        names += [k for k, v in _SERVICE_EMOJI_MAP if v == _SHARED_PLACEHOLDER_EMOJI_ID]
+        seen, missing = set(), []
+        for nme in names:
+            kk = str(nme).strip().lower()
+            if kk and kk not in seen:
+                seen.add(kk)
+                if _resolve_app_emoji(kk)[1] == "none":
+                    missing.append(str(nme).strip())
+        ov_txt = "\n".join(f"{get_platform_icon(k)} {html.escape(k)} → <code>{v}</code>" for k, v in ov.items()) or "—"
+        miss_txt = "\n".join(f"{get_app_fallback_char(m)} {html.escape(m)}" for m in missing[:40]) or "—"
+        await update.message.reply_text(
+            f"📋 <b>APP PREMIUM EMOJIS</b>\n\n<b>✅ সেট করা:</b>\n<blockquote>{ov_txt}</blockquote>\n"
+            f"<b>⚠️ premium emoji নেই (সাধারণ emoji দেখাচ্ছে):</b>\n<blockquote>{miss_txt}</blockquote>",
+            parse_mode="HTML", reply_markup=app_emoji_keyboard())
         return
 
     # ==================== SET NUMBERS PER REQUEST ====================
@@ -5034,8 +5488,10 @@ async def _build_force_join_buttons(context, not_joined):
     """Builds JOIN buttons only for channels not yet joined, plus a CHECK
     button at the end to re-verify without retyping any command."""
     buttons = []
+    _fm = load_settings().get("force_join_meta") or {}
     for channel in not_joined:
         channel_clean = str(channel).lstrip("@")
+        _m = _fm.get(str(channel)) or {}
         try:
             chat = await context.bot.get_chat(channel)
             invite_url = chat.invite_link or f"https://t.me/{channel_clean}"
@@ -5043,7 +5499,10 @@ async def _build_force_join_buttons(context, not_joined):
         except Exception:
             invite_url = f"https://t.me/{channel_clean}"
             title = channel_clean
-        buttons.append([InlineKeyboardButton(f"✅ JOIN {title}", url=invite_url,
+        if _m.get("link"):
+            invite_url = _m["link"]
+        _btn_text = _m.get("label") or f"✅ JOIN {title}"
+        buttons.append([InlineKeyboardButton(_btn_text, url=invite_url,
                                               api_kwargs={"icon_custom_emoji_id": "5875017993909440887", "style": "success"})])
     buttons.append([InlineKeyboardButton("🔄 CHECK", callback_data="fj_check",
                                           api_kwargs={"icon_custom_emoji_id": "5231200819986047254", "style": "primary"})])
@@ -5334,7 +5793,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "same_range":
         r_text = last_range.get(uid)
         if r_text:
-            otp_url = load_settings().get("otp_group_url") or "https://t.me/+31eV11IT7WQzMjI9"
+            otp_url = get_otp_group_url()
             try:
                 await query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("📢 OTP GROUP", url=otp_url, api_kwargs={"style": "primary"})
